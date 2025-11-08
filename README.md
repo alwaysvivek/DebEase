@@ -1,71 +1,176 @@
 # DebEase
 
-DebEase is a full-stack Django web application designed to simplify system configuration tasks on Debian-based systems. The application provides a user-friendly interface for performing various tasks such as installing packages, configuring login managers, installing drivers, and more.
+DebEase is a post-install orchestration tool for Debian-based systems with a lightweight web UI.  
+This repository adds a realtime installer service that accepts install requests, runs package installations (or simulates them for development), and streams logs and progress to web clients via WebSockets.
 
-## Features
+This README describes the current implementation (backend and frontend), how to run it, the API and WebSocket message formats, configuration, and development notes.
 
-- **Change Default Login Manager:** Allows users to change the default login manager on their Debian system.
+---
 
-- **Install Microcode:** Installs CPU microcode for improved performance and compatibility.
+## Highlights / Goals
 
-- **Install GPU Drivers:** Installs GPU drivers for better graphics performance.
+- Real-time installation orchestration with WebSocket streaming of logs and progress.
+- Simple searchable package catalog and enqueueable install queue.
+- Safe development mode (SIMULATE_INSTALL) so you can test without root or changing the system.
+- Minimal, modular server written with FastAPI + asyncio:
+  - backend/repository.py — Repository pattern for package metadata and an in-memory job queue.
+  - backend/worker.py — Async InstallerWorker that processes jobs and broadcasts events.
+  - backend/ws_manager.py — WebSocket manager to broadcast messages to connected clients.
+  - backend/app.py — FastAPI app exposing HTTP endpoints and a WebSocket endpoint.
+  - backend/config.py — Small config module for environment-driven configuration.
+- Static frontend under `static/` that consumes REST endpoints and the WebSocket stream.
 
-- **Replace apt with Nala:** Replaces the default package manager (apt) with Nala.
+---
 
-- **Install Battery Saver:** Installs and configures TLP for improved battery life.
+## Architecture (high level)
 
-- **Install App Launcher:** Installs ULauncher as an application launcher.
+Client browser ⇄ FastAPI HTTP endpoints (enqueue, packages, queue)  
+Client browser ⇄ WebSocket (ws://server/ws) ⇄ WSManager ⇄ InstallerWorker ⇄ apt / simulated commands
 
-- **Configure Firewall:** Sets up the Uncomplicated Firewall (UFW) for enhanced security.
+Key design choices:
+- Repository pattern isolates data operations (easy to replace with DB later).
+- Async worker + asyncio subprocess provides non-blocking operations and concurrent handling.
+- WebSocket manager provides a lightweight broadcast channel for realtime UI updates.
 
-- **Install Timeshift:** Installs Timeshift, a backup tool for creating system snapshots.
+---
 
-- **Install WebApp Manager:** Installs Linux Mint's web app manager.
+## What’s implemented
 
-- **Setup Custom Scripts:** Configures custom scripts to streamline accessibility.
+- HTTP endpoints:
+  - GET /packages — search and pagination for the package catalog.
+  - POST /enqueue — enqueue a package install job.
+  - GET /queue — list current jobs and status.
+  - GET / — serves the static web UI from `static/index.html`.
+- WebSocket:
+  - /ws — broadcast realtime events: job_started, stdout, progress, job_finished.
+- InstallerWorker:
+  - SIMULATE_INSTALL mode (default) emits simulated logs/progress for safe development.
+  - Real install mode executes `sudo apt-get install -y <package>` (requires root/sudo).
+- In-memory job repository and queue. (Replaceable with persistent storage later.)
+- Minimal static UI: `static/index.html`, `static/app.js`, `static/styles.css`.
 
-- **Configure Terminal Aliases:** Sets up aliases for commonly used terminal commands.
+---
 
-- **Install KDE-Connect:** Installs KDE-Connect for seamless device integration.
+## Quickstart (development / local)
 
-- **Enhance Terminal:** Installs and configures Starship for a customized terminal prompt.
+Requirements:
+- Python 3.9+
+- Recommended packages: fastapi, uvicorn
 
-- **Make LibreOffice Look Better:** Applies a custom theme to LibreOffice for improved aesthetics.
+Install dependencies:
+```bash
+pip install fastapi uvicorn
+```
 
-## Prerequisites
+Run the server (simulate mode — safe for local use):
+```bash
+export DEBEASE_SIMULATE_INSTALL=true
+python -m backend.app
+# by default listens on 0.0.0.0:8080 (configurable)
+```
 
-- Debian-based system (tested on Debian)
-- Python 3
-- Django
-- Puppet
-- Additional dependencies as specified in `dependencies.sh`
+Open a browser: http://localhost:8080/ — the UI lists packages, allows enqueueing installs, and shows realtime logs.
 
-## Installation
+To run real installs (not recommended on development machines):
+- Set `DEBEASE_SIMULATE_INSTALL=false` and run the process as a user with appropriate privileges (apt install requires root/sudo).
 
-1. Clone the repository:
+---
 
-   ```bash
-   git clone https://github.com/yourusername/DebEase.git
-   cd DebEase
-   ```
+## Configuration (environment variables)
 
-2. Run the dependencies script:
+- DEBEASE_PORT — port to listen on (default: `8080`).
+- DEBEASE_HOST — host to bind (default: `0.0.0.0`).
+- DEBEASE_SIMULATE_INSTALL — `"true"` (default) to simulate installs; set to `"false"` to run `apt-get`.
+- DEBEASE_WORKER_CONCURRENCY — number of concurrent worker tasks (default: `1`).
 
-   ```bash
-   sudo bash resources/dependencies.sh
-   ```
+---
 
-3. Apply migrations and start the Django development server:
+## API Reference
 
-   ```bash
-   python manage.py runserver
-   ```
+List packages:
+```
+GET /packages?q=<query>&page=<n>&size=<s>
+Response: { total, page, size, items: [ { name, description, version, tags } ] }
+```
 
-4. Access the application in your web browser at [http://localhost:8000](http://localhost:8000).
+Enqueue a package:
+```
+POST /enqueue
+Body (JSON): { "package": "vim" }
+Response: { "job_id": "<uuid>", "status": "queued" }
+```
 
-## Usage
+List jobs:
+```
+GET /queue
+Response: [ { job_id, package, status, created_at, started_at?, finished_at?, exit_code?, log? } ]
+```
 
-1. Visit the homepage and select the tasks you want to perform.
-2. Click the "Run" button to execute the selected tasks.
+WebSocket endpoint:
+```
+ws://<host>:<port>/ws
+```
 
+WebSocket message examples (JSON):
+- job_started
+  ```json
+  {"type":"job_started","job_id":"...","package":"nginx","timestamp":1234567890.1}
+  ```
+- stdout
+  ```json
+  {"type":"stdout","job_id":"...","line":"some output","timestamp":1234567890.2}
+  ```
+- progress
+  ```json
+  {"type":"progress","job_id":"...","percent":40,"timestamp":1234567890.3}
+  ```
+- job_finished
+  ```json
+  {"type":"job_finished","job_id":"...","success":true,"exit_code":0,"timestamp":1234567890.4}
+  ```
 
+Clients may connect and listen to all events and filter locally by `job_id`. The current implementation broadcasts to all clients (simple pub/sub).
+
+---
+
+## Testing
+
+A small set of unit tests is included under `tests/` (repository and ws manager). Tests are async-friendly using pytest. Example:
+
+```bash
+pip install pytest
+pytest
+```
+
+Note: Integration / E2E tests that exercise the full flow require the server to be running (or can be adapted to use TestClient/AsyncClient to run the app in-process).
+
+---
+
+## Development notes
+
+- Files of interest:
+  - backend/repository.py — PackageRepository, JobQueueRepository
+  - backend/worker.py — InstallerWorker implementation
+  - backend/ws_manager.py — WSManager broadcasting logic
+  - backend/app.py — FastAPI application / endpoints and startup/shutdown lifecycle
+  - static/* — frontend assets
+- The in-memory repositories make it easy to iterate quickly. For production, consider:
+  - Persisting jobs in a database (SQLite/Postgres).
+  - Using a message broker (Redis/RabbitMQ) for multi-process or multi-host worker coordination.
+  - Adding authentication/authorization to API endpoints.
+
+---
+
+## Contribution
+
+Contributions are welcome. Suggested next improvements:
+- Convert JobQueueRepository to a Redis-backed queue for durability and scaling.
+- Replace in-memory package catalog with a persisted catalog and package metadata syncing.
+- Add authentication and role-based authorization for enqueueing packages.
+- Improve frontend UX: job details, per-job filtering, and log search.
+
+When opening PRs:
+- Target branch: `main` (or open from `feature/*` branches).
+- Include tests for added functionality and documentation updates when appropriate.
+
+---
